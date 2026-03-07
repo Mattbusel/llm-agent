@@ -1,56 +1,67 @@
 #define LLM_AGENT_IMPLEMENTATION
 #include "llm_agent.hpp"
-#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
 int main() {
     const char* key = std::getenv("OPENAI_API_KEY");
-    if (!key || !key[0]) { std::cerr << "OPENAI_API_KEY not set\n"; return 1; }
+    if (!key) { std::cerr << "OPENAI_API_KEY not set\n"; return 1; }
 
-    llm::Tool add_tool;
-    add_tool.name              = "add";
-    add_tool.description       = "Add two numbers together";
-    add_tool.param_names       = {"a", "b"};
-    add_tool.param_descriptions = {"First number", "Second number"};
-    add_tool.fn = [](std::map<std::string, std::string> args) -> std::string {
-        try {
-            double a = std::stod(args["a"]), b = std::stod(args["b"]);
-            return std::to_string(a + b);
-        } catch (...) { return "error: invalid numbers"; }
-    };
-
-    llm::Tool sqrt_tool;
-    sqrt_tool.name              = "sqrt";
-    sqrt_tool.description       = "Compute the square root of a number";
-    sqrt_tool.param_names       = {"x"};
-    sqrt_tool.param_descriptions = {"Number to take the square root of"};
-    sqrt_tool.fn = [](std::map<std::string, std::string> args) -> std::string {
-        try {
-            double x = std::stod(args["x"]);
-            if (x < 0) return "error: negative number";
-            return std::to_string(std::sqrt(x));
-        } catch (...) { return "error: invalid number"; }
+    std::vector<llm::Tool> tools = {
+        {
+            "add", "Add two numbers", {"a", "b"}, {"First number", "Second number"},
+            [](std::map<std::string,std::string> args) -> std::string {
+                double a = std::stod(args["a"]), b = std::stod(args["b"]);
+                return std::to_string(a + b);
+            }
+        },
+        {
+            "multiply", "Multiply two numbers", {"a", "b"}, {"First number", "Second number"},
+            [](std::map<std::string,std::string> args) -> std::string {
+                double a = std::stod(args["a"]), b = std::stod(args["b"]);
+                return std::to_string(a * b);
+            }
+        },
+        {
+            "divide", "Divide a by b", {"a", "b"}, {"Numerator", "Denominator"},
+            [](std::map<std::string,std::string> args) -> std::string {
+                double a = std::stod(args["a"]), b = std::stod(args["b"]);
+                if (b == 0) throw std::runtime_error("division by zero");
+                return std::to_string(a / b);
+            }
+        }
     };
 
     llm::AgentConfig cfg;
-    cfg.api_key = key;
-    cfg.model   = "gpt-4o-mini";
-    cfg.verbose = false;
+    cfg.api_key      = key;
+    cfg.model        = "gpt-4o-mini";
+    cfg.verbose      = true;
+    cfg.system_prompt = "You are a calculator assistant. Use the provided tools to compute answers.";
 
-    auto result = llm::run_agent(
-        "What is the square root of (3 + 13)?",
-        {add_tool, sqrt_tool},
-        cfg
-    );
+    std::string prompt = "What is (15 + 27) * 3, then divide by 6?";
+    std::cout << "Prompt: " << prompt << "\n\n";
 
-    std::cout << "Answer: " << result.answer << "\n";
-    std::cout << "Steps:  " << result.iterations_used << "\n";
-    for (const auto& step : result.steps) {
-        if (step.type == llm::AgentStep::Type::ToolCall)
-            std::cout << "  tool=" << step.tool_name
-                      << " result=" << step.tool_result << "\n";
+    auto result = llm::run_agent(prompt, tools, cfg);
+
+    std::cout << "\n--- Trace ---\n";
+    for (size_t i = 0; i < result.steps.size(); ++i) {
+        const auto& s = result.steps[i];
+        if (s.type == llm::AgentStep::Type::ToolCall) {
+            std::cout << "Step " << (i+1) << ": tool=" << s.tool_name << "(";
+            bool first = true;
+            for (const auto& kv : s.tool_args) {
+                if (!first) std::cout << ", ";
+                std::cout << kv.first << "=" << kv.second;
+                first = false;
+            }
+            std::cout << ") -> " << s.tool_result << "\n";
+        } else {
+            std::cout << "Step " << (i+1) << ": [final answer]\n";
+        }
     }
+
+    std::cout << "\nAnswer: " << result.answer << "\n";
+    std::cout << "Iterations: " << result.iterations_used << "\n";
     return 0;
 }

@@ -1,13 +1,6 @@
 #pragma once
-
-// llm_agent.hpp -- Zero-dependency single-header C++ tool-calling agent loop.
-// Define tools as C++ lambdas, let the model call them via OpenAI function calling.
-//
-// USAGE:
-//   #define LLM_AGENT_IMPLEMENTATION  (in exactly one .cpp)
-//   #include "llm_agent.hpp"
-//
-// Requires: libcurl
+// llm-agent: single-header C++ tool-calling agent loop
+// #define LLM_AGENT_IMPLEMENTATION in ONE .cpp before including.
 
 #include <functional>
 #include <map>
@@ -34,7 +27,7 @@ struct AgentConfig {
 
 struct AgentStep {
     enum class Type { ToolCall, FinalAnswer };
-    Type        type = Type::FinalAnswer;
+    Type        type;
     std::string tool_name;
     std::map<std::string, std::string> tool_args;
     std::string tool_result;
@@ -42,264 +35,289 @@ struct AgentStep {
 };
 
 struct AgentResult {
-    std::string             answer;
-    std::vector<AgentStep>  steps;
-    int                     iterations_used        = 0;
-    bool                    max_iterations_reached = false;
+    std::string            answer;
+    std::vector<AgentStep> steps;
+    int                    iterations_used;
+    bool                   max_iterations_reached;
 };
 
 AgentResult run_agent(
-    const std::string&       prompt,
-    const std::vector<Tool>& tools,
-    const AgentConfig&       config
+    const std::string&        prompt,
+    const std::vector<Tool>&  tools,
+    const AgentConfig&        config
 );
 
 } // namespace llm
 
-// ---------------------------------------------------------------------------
-// Implementation
-// ---------------------------------------------------------------------------
-
 #ifdef LLM_AGENT_IMPLEMENTATION
 
-#include <curl/curl.h>
-#include <cstdio>
-#include <iostream>
 #include <sstream>
+#include <stdexcept>
+#include <iostream>
+#include <curl/curl.h>
 
 namespace llm {
 namespace detail {
 
-// ---------------------------------------------------------------------------
-// RAII curl
-// ---------------------------------------------------------------------------
-struct CurlH {
-    CURL* h = nullptr;
-    CurlH() : h(curl_easy_init()) {}
-    ~CurlH() { if (h) curl_easy_cleanup(h); }
-    CurlH(const CurlH&) = delete;
-    CurlH& operator=(const CurlH&) = delete;
-    bool ok() const { return h != nullptr; }
+struct CurlHandle {
+    CURL* h;
+    CurlHandle()  : h(curl_easy_init()) {}
+    ~CurlHandle() { if (h) curl_easy_cleanup(h); }
+    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle& operator=(const CurlHandle&) = delete;
 };
 
-struct CurlSl {
-    curl_slist* l = nullptr;
-    ~CurlSl() { if (l) curl_slist_free_all(l); }
-    CurlSl(const CurlSl&) = delete;
-    CurlSl& operator=(const CurlSl&) = delete;
-    CurlSl() = default;
-    void append(const char* s) { l = curl_slist_append(l, s); }
+struct SlistHandle {
+    curl_slist* s = nullptr;
+    ~SlistHandle() { if (s) curl_slist_free_all(s); }
 };
 
-static size_t wcb(char* p, size_t s, size_t n, void* ud) {
-    static_cast<std::string*>(ud)->append(p, s * n);
-    return s * n;
+static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
+    static_cast<std::string*>(ud)->append(ptr, size * nmemb);
+    return size * nmemb;
 }
 
-static std::string post(const std::string& url, const std::string& body,
-                         const std::string& key) {
-    CurlH c;
-    if (!c.ok()) return {};
-    CurlSl h;
-    h.append("Content-Type: application/json");
-    h.append(("Authorization: Bearer " + key).c_str());
+static std::string post_json(const std::string& url, const std::string& api_key, const std::string& body) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CurlHandle ch;
+    if (!ch.h) { curl_global_cleanup(); throw std::runtime_error("curl_easy_init failed"); }
+    SlistHandle sh;
+    sh.s = curl_slist_append(sh.s, ("Authorization: Bearer " + api_key).c_str());
+    sh.s = curl_slist_append(sh.s, "Content-Type: application/json");
     std::string resp;
-    curl_easy_setopt(c.h, CURLOPT_URL,            url.c_str());
-    curl_easy_setopt(c.h, CURLOPT_HTTPHEADER,     h.l);
-    curl_easy_setopt(c.h, CURLOPT_POSTFIELDS,     body.c_str());
-    curl_easy_setopt(c.h, CURLOPT_WRITEFUNCTION,  wcb);
-    curl_easy_setopt(c.h, CURLOPT_WRITEDATA,      &resp);
-    curl_easy_setopt(c.h, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_perform(c.h);
+    curl_easy_setopt(ch.h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(ch.h, CURLOPT_HTTPHEADER, sh.s);
+    curl_easy_setopt(ch.h, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(ch.h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(ch.h, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYPEER, 1L);
+    CURLcode rc = curl_easy_perform(ch.h);
+    curl_global_cleanup();
+    if (rc != CURLE_OK) throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(rc));
     return resp;
 }
 
-// ---------------------------------------------------------------------------
-// Minimal JSON helpers
-// ---------------------------------------------------------------------------
-static std::string jesc(const std::string& s) {
-    std::string o;
+static std::string json_escape(const std::string& s) {
+    std::string out;
     for (unsigned char c : s) {
-        switch(c) { case '"': o+="\\\""; break; case '\\': o+="\\\\"; break;
-                    case '\n': o+="\\n"; break; case '\r': o+="\\r"; break;
-                    case '\t': o+="\\t"; break;
-                    default: if(c<0x20){char b[8];snprintf(b,sizeof(b),"\\u%04x",c);o+=b;}
-                             else o+=static_cast<char>(c); }
-    }
-    return o;
-}
-
-static std::string jstr(const std::string& j, const std::string& k) {
-    std::string pat = "\"" + k + "\"";
-    auto p = j.find(pat);
-    if (p == std::string::npos) return {};
-    p += pat.size();
-    while (p < j.size() && (j[p]==' '||j[p]==':')) ++p;
-    if (p >= j.size() || j[p] != '"') return {};
-    ++p;
-    std::string v;
-    while (p < j.size() && j[p] != '"') {
-        if (j[p]=='\\' && p+1<j.size()) {
-            char e=j[++p];
-            switch(e){case 'n':v+='\n';break;case 't':v+='\t';break;
-                      case '"':v+='"';break;case '\\':v+='\\';break;default:v+=e;}
-        } else v+=j[p];
-        ++p;
-    }
-    return v;
-}
-
-// Extract finish_reason
-static std::string finish_reason(const std::string& j) {
-    return jstr(j, "finish_reason");
-}
-
-// Extract content of first choice message
-static std::string msg_content(const std::string& j) {
-    auto p = j.find("\"message\"");
-    if (p == std::string::npos) return {};
-    return jstr(j.substr(p), "content");
-}
-
-// Check if response contains tool_calls
-static bool has_tool_calls(const std::string& j) {
-    return j.find("\"tool_calls\"") != std::string::npos;
-}
-
-// Extract tool call: name and arguments string
-static bool extract_tool_call(const std::string& j,
-                                std::string& tool_name,
-                                std::string& args_json) {
-    auto tc = j.find("\"tool_calls\"");
-    if (tc == std::string::npos) return false;
-    auto fn = j.find("\"function\"", tc);
-    if (fn == std::string::npos) return false;
-    tool_name = jstr(j.substr(fn), "name");
-    args_json = jstr(j.substr(fn), "arguments");
-    return !tool_name.empty();
-}
-
-// Parse flat JSON object into key->value map (string values only)
-static std::map<std::string, std::string> parse_args(const std::string& json) {
-    std::map<std::string, std::string> out;
-    size_t p = 0;
-    while (p < json.size()) {
-        auto ks = json.find('"', p);
-        if (ks == std::string::npos) break;
-        auto ke = json.find('"', ks + 1);
-        if (ke == std::string::npos) break;
-        std::string key = json.substr(ks + 1, ke - ks - 1);
-        p = ke + 1;
-        while (p < json.size() && (json[p] == ':' || json[p] == ' ')) ++p;
-        std::string val;
-        if (p < json.size() && json[p] == '"') {
-            ++p;
-            while (p < json.size() && json[p] != '"') {
-                if (json[p]=='\\' && p+1<json.size()) {
-                    char e=json[++p];
-                    switch(e){case 'n':val+='\n';break;case '"':val+='"';break;
-                              case '\\':val+='\\';break;default:val+=e;}
-                } else val+=json[p];
-                ++p;
-            }
-            ++p;
-        } else {
-            // number or bool
-            auto ve = json.find_first_of(",}", p);
-            val = (ve != std::string::npos) ? json.substr(p, ve - p) : json.substr(p);
-            p = (ve != std::string::npos) ? ve : json.size();
-        }
-        out[key] = val;
+        if      (c=='"')  out += "\\\"";
+        else if (c=='\\') out += "\\\\";
+        else if (c=='\n') out += "\\n";
+        else if (c=='\r') out += "\\r";
+        else if (c=='\t') out += "\\t";
+        else if (c<0x20)  { out += "\\u00"; out += "0123456789abcdef"[c>>4]; out += "0123456789abcdef"[c&0xf]; }
+        else              out += static_cast<char>(c);
     }
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Build request JSON
-// ---------------------------------------------------------------------------
-static std::string build_request(
-    const std::vector<std::pair<std::string,std::string>>& messages, // role, content
-    const std::vector<Tool>& tools,
-    const AgentConfig& cfg)
-{
-    std::ostringstream ss;
-    ss << "{\"model\":\"" << jesc(cfg.model) << "\",\"messages\":[";
-    bool first = true;
-    for (const auto& [role, content] : messages) {
-        if (!first) ss << ',';
-        ss << "{\"role\":\"" << jesc(role) << "\",\"content\":\"" << jesc(content) << "\"}";
-        first = false;
+// Extract a string value for key from JSON (simple, non-nested)
+static std::string json_str(const std::string& json, const std::string& key) {
+    auto pos = json.find("\"" + key + "\":\"");
+    if (pos == std::string::npos) return "";
+    pos += key.size() + 4;
+    std::string val;
+    while (pos < json.size() && json[pos] != '"') {
+        if (json[pos] == '\\' && pos+1 < json.size()) { ++pos; val += json[pos]; }
+        else val += json[pos];
+        ++pos;
     }
-    ss << "]";
+    return val;
+}
 
-    if (!tools.empty()) {
-        ss << ",\"tools\":[";
-        for (size_t ti = 0; ti < tools.size(); ++ti) {
-            if (ti) ss << ',';
-            const auto& t = tools[ti];
-            ss << "{\"type\":\"function\",\"function\":{"
-               << "\"name\":\"" << jesc(t.name) << "\","
-               << "\"description\":\"" << jesc(t.description) << "\","
-               << "\"parameters\":{\"type\":\"object\",\"properties\":{";
-            for (size_t pi = 0; pi < t.param_names.size(); ++pi) {
-                if (pi) ss << ',';
-                std::string desc = pi < t.param_descriptions.size()
-                    ? t.param_descriptions[pi] : t.param_names[pi];
-                ss << "\"" << jesc(t.param_names[pi]) << "\":"
-                   << "{\"type\":\"string\",\"description\":\"" << jesc(desc) << "\"}";
-            }
-            ss << "},\"required\":[";
-            for (size_t pi = 0; pi < t.param_names.size(); ++pi) {
-                if (pi) ss << ',';
-                ss << '"' << jesc(t.param_names[pi]) << '"';
-            }
-            ss << "]}}}";
+static std::string json_str_raw(const std::string& json, const std::string& key) {
+    // also handles non-quoted values (for finish_reason etc)
+    auto pos = json.find("\"" + key + "\":");
+    if (pos == std::string::npos) return "";
+    pos += key.size() + 3;
+    while (pos < json.size() && json[pos] == ' ') ++pos;
+    if (pos < json.size() && json[pos] == '"') {
+        ++pos;
+        std::string val;
+        while (pos < json.size() && json[pos] != '"') {
+            if (json[pos]=='\\' && pos+1<json.size()){++pos;val+=json[pos];}
+            else val+=json[pos];
+            ++pos;
         }
-        ss << "],\"tool_choice\":\"auto\"";
+        return val;
     }
-    ss << "}";
-    return ss.str();
+    // bare value
+    std::string val;
+    while (pos < json.size() && json[pos] != ',' && json[pos] != '}' && json[pos] != '\n') val += json[pos++];
+    // trim
+    while (!val.empty() && (val.back()==' '||val.back()=='\r')) val.pop_back();
+    return val;
+}
+
+// Build tools JSON array for OpenAI function calling
+static std::string build_tools_json(const std::vector<Tool>& tools) {
+    std::string out = "[";
+    for (size_t ti = 0; ti < tools.size(); ++ti) {
+        const auto& t = tools[ti];
+        if (ti) out += ",";
+        out += "{\"type\":\"function\",\"function\":{";
+        out += "\"name\":\"" + json_escape(t.name) + "\",";
+        out += "\"description\":\"" + json_escape(t.description) + "\",";
+        out += "\"parameters\":{\"type\":\"object\",\"properties\":{";
+        for (size_t pi = 0; pi < t.param_names.size(); ++pi) {
+            if (pi) out += ",";
+            std::string desc = pi < t.param_descriptions.size() ? t.param_descriptions[pi] : "";
+            out += "\"" + json_escape(t.param_names[pi]) + "\":{\"type\":\"string\",\"description\":\"" + json_escape(desc) + "\"}";
+        }
+        out += "},\"required\":[";
+        for (size_t pi = 0; pi < t.param_names.size(); ++pi) {
+            if (pi) out += ",";
+            out += "\"" + json_escape(t.param_names[pi]) + "\"";
+        }
+        out += "]}}}";
+    }
+    out += "]";
+    return out;
+}
+
+// Parse tool_calls from response — returns first tool call name + arguments JSON string
+static bool parse_tool_call(const std::string& resp,
+                              std::string& tool_name,
+                              std::string& args_json,
+                              std::string& call_id) {
+    auto pos = resp.find("\"tool_calls\"");
+    if (pos == std::string::npos) return false;
+    // find function name
+    auto fn_pos = resp.find("\"name\":", pos);
+    if (fn_pos == std::string::npos) return false;
+    tool_name = json_str(resp.substr(fn_pos), "name");
+    // find arguments
+    auto arg_pos = resp.find("\"arguments\":", pos);
+    if (arg_pos == std::string::npos) return false;
+    arg_pos += 12; // skip "arguments":
+    while (arg_pos < resp.size() && resp[arg_pos]==' ') ++arg_pos;
+    if (arg_pos < resp.size() && resp[arg_pos]=='"') {
+        ++arg_pos;
+        std::string raw;
+        while (arg_pos < resp.size() && resp[arg_pos]!='"') {
+            if (resp[arg_pos]=='\\' && arg_pos+1<resp.size()){++arg_pos;raw+=resp[arg_pos];}
+            else raw+=resp[arg_pos];
+            ++arg_pos;
+        }
+        args_json = raw;
+    }
+    // find call id
+    auto id_pos = resp.find("\"id\":", pos);
+    if (id_pos != std::string::npos) call_id = json_str(resp.substr(id_pos), "id");
+    return !tool_name.empty();
+}
+
+// Parse key:value pairs from a JSON object string like {"a":"1","b":"2"}
+static std::map<std::string,std::string> parse_args(const std::string& args_json) {
+    std::map<std::string,std::string> result;
+    size_t i = 0;
+    while (i < args_json.size()) {
+        // find key
+        auto kstart = args_json.find('"', i);
+        if (kstart == std::string::npos) break;
+        ++kstart;
+        auto kend = args_json.find('"', kstart);
+        if (kend == std::string::npos) break;
+        std::string key = args_json.substr(kstart, kend-kstart);
+        // find colon
+        auto colon = args_json.find(':', kend);
+        if (colon == std::string::npos) break;
+        ++colon;
+        while (colon < args_json.size() && args_json[colon]==' ') ++colon;
+        std::string val;
+        if (colon < args_json.size() && args_json[colon]=='"') {
+            ++colon;
+            while (colon < args_json.size() && args_json[colon]!='"') {
+                if (args_json[colon]=='\\' && colon+1<args_json.size()){++colon;val+=args_json[colon];}
+                else val+=args_json[colon];
+                ++colon;
+            }
+            ++colon;
+        } else {
+            auto vend = args_json.find_first_of(",}", colon);
+            val = args_json.substr(colon, vend==std::string::npos ? std::string::npos : vend-colon);
+            while (!val.empty() && val.back()==' ') val.pop_back();
+            colon = vend;
+        }
+        result[key] = val;
+        i = (colon == std::string::npos) ? args_json.size() : colon+1;
+    }
+    return result;
+}
+
+// Extract content text from response
+static std::string parse_content(const std::string& resp) {
+    auto pos = resp.find("\"content\":");
+    if (pos == std::string::npos) return "";
+    pos += 10;
+    while (pos < resp.size() && resp[pos]==' ') ++pos;
+    if (pos < resp.size() && resp[pos]=='n') return ""; // null
+    if (pos < resp.size() && resp[pos]=='"') {
+        ++pos;
+        std::string val;
+        while (pos < resp.size() && resp[pos]!='"') {
+            if (resp[pos]=='\\' && pos+1<resp.size()){++pos;val+=resp[pos];}
+            else val+=resp[pos];
+            ++pos;
+        }
+        return val;
+    }
+    return "";
 }
 
 } // namespace detail
 
-// ---------------------------------------------------------------------------
-// Public: run_agent
-// ---------------------------------------------------------------------------
-
-AgentResult run_agent(
-    const std::string&       prompt,
-    const std::vector<Tool>& tools,
-    const AgentConfig&       cfg)
-{
+AgentResult run_agent(const std::string& prompt,
+                       const std::vector<Tool>& tools,
+                       const AgentConfig& config) {
     AgentResult result;
+    result.iterations_used        = 0;
+    result.max_iterations_reached = false;
 
-    std::vector<std::pair<std::string,std::string>> messages;
-    if (!cfg.system_prompt.empty())
-        messages.push_back({"system", cfg.system_prompt});
-    messages.push_back({"user", prompt});
+    // Build conversation history as a JSON array string
+    std::string messages = "[";
+    if (!config.system_prompt.empty())
+        messages += "{\"role\":\"system\",\"content\":\"" + detail::json_escape(config.system_prompt) + "\"},";
+    messages += "{\"role\":\"user\",\"content\":\"" + detail::json_escape(prompt) + "\"}";
 
-    for (int iter = 0; iter < cfg.max_iterations; ++iter) {
-        result.iterations_used = iter + 1;
+    std::string tools_json = detail::build_tools_json(tools);
 
-        std::string body = detail::build_request(messages, tools, cfg);
-        std::string resp = detail::post(
-            "https://api.openai.com/v1/chat/completions", body, cfg.api_key);
+    for (int iter = 0; iter < config.max_iterations; ++iter) {
+        ++result.iterations_used;
 
-        if (cfg.verbose)
-            std::cerr << "[llm-agent] iter " << iter << " response: " << resp << "\n";
+        std::string body = "{\"model\":\"" + config.model + "\","
+                           "\"messages\":" + messages + "],"
+                           "\"tools\":" + tools_json + ","
+                           "\"tool_choice\":\"auto\"}";
 
-        if (detail::has_tool_calls(resp)) {
-            std::string tool_name, args_json;
-            if (!detail::extract_tool_call(resp, tool_name, args_json)) break;
+        if (config.verbose) std::cerr << "[agent] Iteration " << (iter+1) << " request...\n";
 
+        std::string resp = detail::post_json(
+            "https://api.openai.com/v1/chat/completions",
+            config.api_key, body);
+
+        if (config.verbose) std::cerr << "[agent] Response: " << resp.substr(0, 200) << "...\n";
+
+        // Check finish_reason
+        std::string finish = detail::json_str_raw(resp, "finish_reason");
+
+        std::string tool_name, args_json, call_id;
+        bool has_tool = detail::parse_tool_call(resp, tool_name, args_json, call_id);
+
+        if (has_tool && finish != "stop") {
             auto args = detail::parse_args(args_json);
 
-            // Find and call the tool
-            std::string tool_result = "[tool not found: " + tool_name + "]";
+            // Find tool
+            std::string tool_result = "[tool not found]";
             for (const auto& t : tools) {
-                if (t.name == tool_name) { tool_result = t.fn(args); break; }
+                if (t.name == tool_name) {
+                    try { tool_result = t.fn(args); }
+                    catch (const std::exception& e) { tool_result = std::string("[error] ") + e.what(); }
+                    break;
+                }
             }
+
+            if (config.verbose) std::cerr << "[agent] Tool " << tool_name << " -> " << tool_result << "\n";
 
             AgentStep step;
             step.type        = AgentStep::Type::ToolCall;
@@ -308,24 +326,22 @@ AgentResult run_agent(
             step.tool_result = tool_result;
             result.steps.push_back(step);
 
-            if (cfg.verbose)
-                std::cerr << "[llm-agent] tool=" << tool_name
-                          << " result=" << tool_result << "\n";
-
-            // Add assistant message + tool result to conversation
-            messages.push_back({"assistant",
-                "[called " + tool_name + "(" + args_json + ") -> " + tool_result + "]"});
-            messages.push_back({"user",
-                "Tool result for " + tool_name + ": " + tool_result + ". Continue."});
-
+            // Append assistant tool call + tool result to messages
+            messages += ",{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"" +
+                        detail::json_escape(call_id) + "\",\"type\":\"function\",\"function\":{\"name\":\"" +
+                        detail::json_escape(tool_name) + "\",\"arguments\":\"" +
+                        detail::json_escape(args_json) + "\"}}]}";
+            messages += ",{\"role\":\"tool\",\"tool_call_id\":\"" +
+                        detail::json_escape(call_id) + "\",\"content\":\"" +
+                        detail::json_escape(tool_result) + "\"}";
         } else {
             // Final answer
-            std::string answer = detail::msg_content(resp);
+            std::string content = detail::parse_content(resp);
+            result.answer = content;
             AgentStep step;
             step.type    = AgentStep::Type::FinalAnswer;
-            step.content = answer;
+            step.content = content;
             result.steps.push_back(step);
-            result.answer = answer;
             return result;
         }
     }
@@ -336,5 +352,4 @@ AgentResult run_agent(
 }
 
 } // namespace llm
-
 #endif // LLM_AGENT_IMPLEMENTATION

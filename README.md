@@ -1,86 +1,102 @@
 # llm-agent
 
-Tool-calling agent loop for C++. One header, libcurl dep.
+Tool-calling agent loop in C++. Define tools as lambdas, let the model call them. Single header.
+
+No LangChain. No frameworks. ~250 lines of C++.
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Single Header](https://img.shields.io/badge/single-header-orange.svg)
-![Requires libcurl](https://img.shields.io/badge/deps-libcurl-yellow.svg)
+![libcurl](https://img.shields.io/badge/dep-libcurl-lightgrey.svg)
 
 ## Quickstart
 
 ```cpp
 #define LLM_AGENT_IMPLEMENTATION
 #include "llm_agent.hpp"
+#include <iostream>
 
-// Define a tool
-llm::Tool weather;
-weather.name              = "get_weather";
-weather.description       = "Get current weather for a city";
-weather.param_names       = {"city"};
-weather.param_descriptions = {"City name"};
-weather.fn = [](std::map<std::string, std::string> args) -> std::string {
-    return "Sunny, 22°C in " + args["city"];
+int main() {
+    llm::Tool add_tool{
+        "add", "Add two numbers", {"a","b"}, {"First","Second"},
+        [](std::map<std::string,std::string> args) -> std::string {
+            return std::to_string(std::stod(args["a"]) + std::stod(args["b"]));
+        }
+    };
+
+    llm::AgentConfig cfg;
+    cfg.api_key = std::getenv("OPENAI_API_KEY");
+
+    auto result = llm::run_agent("What is 42 + 58?", {add_tool}, cfg);
+    std::cout << result.answer << "\n";  // "The sum of 42 and 58 is 100."
+}
+```
+
+## Trace output from calculator example
+
+```
+[agent] Iteration 1 request...
+[agent] Tool multiply(a=42, b=3) -> 126.000000
+[agent] Iteration 2 request...
+[agent] Tool divide(a=126, b=6) -> 21.000000
+[agent] Iteration 3 request...
+
+Answer: The result is 21.
+Iterations: 3
+```
+
+## Installation
+
+Copy `include/llm_agent.hpp`. Link `-lcurl`.
+
+## API
+
+```cpp
+// Define tools
+llm::Tool my_tool{
+    "tool_name",
+    "What this tool does (shown to the model)",
+    {"param1", "param2"},              // parameter names
+    {"Description of param1", "..."},  // parameter descriptions
+    [](std::map<std::string,std::string> args) -> std::string {
+        // your implementation
+        return result_string;
+    }
 };
 
+// Configure
 llm::AgentConfig cfg;
-cfg.api_key = "sk-...";
-cfg.model   = "gpt-4o-mini";
+cfg.api_key       = "sk-...";
+cfg.model         = "gpt-4o-mini";
+cfg.max_iterations = 10;
+cfg.verbose       = true;  // print each step to stderr
+cfg.system_prompt = "You are a helpful assistant.";
 
-auto result = llm::run_agent("What's the weather in Paris?", {weather}, cfg);
-std::cout << result.answer << "\n";
-```
+// Run
+llm::AgentResult result = llm::run_agent(prompt, {tool1, tool2}, cfg);
 
-## How It Works
+result.answer;                  // final answer text
+result.steps;                   // full trace
+result.iterations_used;
+result.max_iterations_reached;  // true if hit limit without finishing
 
-1. Send prompt to OpenAI chat completions with tool definitions
-2. If response contains `tool_calls`, dispatch to matching C++ lambda
-3. Inject tool result back into conversation
-4. Repeat until model returns a final text answer or `max_iterations` is reached
-
-## API Reference
-
-### Tool
-
-```cpp
-struct Tool {
-    std::string name;
-    std::string description;
-    std::vector<std::string> param_names;
-    std::vector<std::string> param_descriptions;
-    std::function<std::string(std::map<std::string, std::string>)> fn;
-};
-```
-
-### AgentConfig
-
-```cpp
-struct AgentConfig {
-    std::string api_key;
-    std::string model          = "gpt-4o-mini";
-    int         max_iterations = 10;
-    bool        verbose        = false;   // logs to stderr
-    std::string system_prompt;
-};
-```
-
-### AgentResult
-
-```cpp
-struct AgentResult {
-    std::string            answer;
-    std::vector<AgentStep> steps;
-    int                    iterations_used;
-    bool                   max_iterations_reached;
-};
+// Inspect steps
+for (const auto& step : result.steps) {
+    if (step.type == llm::AgentStep::Type::ToolCall) {
+        step.tool_name;   // which tool was called
+        step.tool_args;   // map of param -> value
+        step.tool_result; // what the tool returned
+    } else {
+        step.content;     // final answer text
+    }
+}
 ```
 
 ## Examples
 
-| File | What it shows |
-|------|--------------|
-| [`examples/calculator.cpp`](examples/calculator.cpp) | add + sqrt tools, multi-step math |
-| [`examples/web_search_mock.cpp`](examples/web_search_mock.cpp) | Mock search tool, multi-query |
+- [`examples/calculator.cpp`](examples/calculator.cpp) — add/multiply/divide tools, multi-step math
+- [`examples/web_search_mock.cpp`](examples/web_search_mock.cpp) — mock search + summarize, multi-step reasoning
+- [`examples/file_agent.cpp`](examples/file_agent.cpp) — read_file/write_file/list_dir tools
 
 ## Building
 
@@ -88,30 +104,29 @@ struct AgentResult {
 cmake -B build && cmake --build build
 export OPENAI_API_KEY=sk-...
 ./build/calculator
-./build/web_search_mock
 ```
 
 ## Requirements
 
-C++17. Requires libcurl.
+C++17. libcurl.
 
 ## See Also
 
 | Repo | What it does |
 |------|-------------|
-| [llm-stream](https://github.com/Mattbusel/llm-stream) | Streaming responses |
-| [llm-cache](https://github.com/Mattbusel/llm-cache) | Response caching |
-| [llm-cost](https://github.com/Mattbusel/llm-cost) | Token counting + cost |
+| [llm-stream](https://github.com/Mattbusel/llm-stream) | Stream OpenAI & Anthropic responses |
 | [llm-retry](https://github.com/Mattbusel/llm-retry) | Retry + circuit breaker |
-| [llm-format](https://github.com/Mattbusel/llm-format) | Structured output |
-| [llm-embed](https://github.com/Mattbusel/llm-embed) | Embeddings + vector search |
+| [llm-cache](https://github.com/Mattbusel/llm-cache) | LRU response cache |
+| [llm-cost](https://github.com/Mattbusel/llm-cost) | Token counting + cost estimation |
+| [llm-format](https://github.com/Mattbusel/llm-format) | Structured output formatting |
+| [llm-embed](https://github.com/Mattbusel/llm-embed) | Text embeddings + vector search |
 | [llm-pool](https://github.com/Mattbusel/llm-pool) | Concurrent request pool |
 | [llm-log](https://github.com/Mattbusel/llm-log) | Structured JSONL logging |
 | [llm-template](https://github.com/Mattbusel/llm-template) | Prompt templating |
-| **llm-agent** *(this repo)* | Tool-calling agent loop |
-| [llm-rag](https://github.com/Mattbusel/llm-rag) | RAG pipeline |
+| [llm-agent](https://github.com/Mattbusel/llm-agent) | Tool-calling agent loop (this repo) |
+| [llm-rag](https://github.com/Mattbusel/llm-rag) | Retrieval-augmented generation |
 | [llm-eval](https://github.com/Mattbusel/llm-eval) | Evaluation + consistency scoring |
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

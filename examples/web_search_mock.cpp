@@ -5,45 +5,59 @@
 #include <map>
 #include <string>
 
-// Mock "web search" tool — returns canned results
-static std::string mock_search(const std::string& query) {
-    static const std::map<std::string, std::string> db = {
-        {"tokio", "Tokio is an async runtime for Rust. Current version: 1.40."},
-        {"openai", "OpenAI was founded in 2015. GPT-4o is their latest model."},
-        {"rust",  "Rust is a systems programming language. Version 1.82 (2024)."},
-    };
-    std::string lq = query;
-    for (char& c : lq) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    for (const auto& [k, v] : db)
-        if (lq.find(k) != std::string::npos) return v;
-    return "No results found for: " + query;
-}
-
 int main() {
     const char* key = std::getenv("OPENAI_API_KEY");
-    if (!key || !key[0]) { std::cerr << "OPENAI_API_KEY not set\n"; return 1; }
+    if (!key) { std::cerr << "OPENAI_API_KEY not set\n"; return 1; }
 
-    llm::Tool search;
-    search.name              = "web_search";
-    search.description       = "Search the web for information about a topic";
-    search.param_names       = {"query"};
-    search.param_descriptions = {"The search query"};
-    search.fn = [](std::map<std::string, std::string> args) -> std::string {
-        return mock_search(args["query"]);
+    // Mock search results
+    std::map<std::string,std::string> search_db = {
+        {"llm streaming",  "LLM streaming uses SSE (Server-Sent Events) to deliver tokens as they are generated."},
+        {"token cost",     "GPT-4o costs $2.50 per million input tokens and $10 per million output tokens."},
+        {"vector search",  "Vector search uses embedding similarity (cosine or dot product) to find relevant documents."},
+        {"circuit breaker","A circuit breaker pattern stops calling a failing service after N failures and retries after a timeout."},
+    };
+
+    std::vector<llm::Tool> tools = {
+        {
+            "search", "Search for information on a topic",
+            {"query"}, {"The search query"},
+            [&](std::map<std::string,std::string> args) -> std::string {
+                const std::string& q = args["query"];
+                for (const auto& kv : search_db)
+                    if (q.find(kv.first) != std::string::npos || kv.first.find(q) != std::string::npos)
+                        return kv.second;
+                return "No results found for: " + q;
+            }
+        },
+        {
+            "summarize", "Summarize a piece of text into one sentence",
+            {"text"}, {"The text to summarize"},
+            [](std::map<std::string,std::string> args) -> std::string {
+                auto& t = args["text"];
+                return t.size() > 80 ? t.substr(0,80) + "..." : t;
+            }
+        }
     };
 
     llm::AgentConfig cfg;
-    cfg.api_key      = key;
-    cfg.model        = "gpt-4o-mini";
-    cfg.system_prompt = "You are a helpful assistant. Use the web_search tool to look up facts.";
+    cfg.api_key   = key;
+    cfg.model     = "gpt-4o-mini";
+    cfg.verbose   = true;
+    cfg.max_iterations = 6;
 
-    auto result = llm::run_agent(
-        "What is Tokio and when was OpenAI founded?",
-        {search},
-        cfg
-    );
+    std::string prompt = "Search for information about LLM streaming and circuit breaker patterns, then give me a combined summary.";
+    std::cout << "Prompt: " << prompt << "\n\n";
 
-    std::cout << "Answer:\n" << result.answer << "\n";
-    std::cout << "\nTool calls made: " << result.steps.size() - 1 << "\n";
+    auto result = llm::run_agent(prompt, tools, cfg);
+
+    std::cout << "\n--- Steps ---\n";
+    for (size_t i = 0; i < result.steps.size(); ++i) {
+        const auto& s = result.steps[i];
+        if (s.type == llm::AgentStep::Type::ToolCall)
+            std::cout << "  [tool] " << s.tool_name << "(" << s.tool_args.begin()->second << ") -> " << s.tool_result << "\n";
+        else
+            std::cout << "  [done]\n";
+    }
+    std::cout << "\nFinal answer:\n" << result.answer << "\n";
     return 0;
 }

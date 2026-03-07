@@ -3,14 +3,13 @@ project(llm_agent_examples CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(CURL REQUIRED)
-
+if(MSVC)
+    add_compile_options(/W4 /WX /D_CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_options(-Wall -Wextra -Werror)
+endif()
 foreach(ex calculator web_search_mock file_agent)
     add_executable(${ex} examples/${ex}.cpp)
     target_include_directories(${ex} PRIVATE include)
     target_link_libraries(${ex} CURL::libcurl)
-    target_compile_options(${ex} PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4>
-        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall>
-        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wextra>
-    )
 endforeach()
