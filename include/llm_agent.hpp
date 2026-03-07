@@ -20,7 +20,9 @@ struct Tool {
 struct AgentConfig {
     std::string api_key;
     std::string model          = "gpt-4o-mini";
+    std::string api_url        = "https://api.openai.com/v1/chat/completions";
     int         max_iterations = 10;
+    long        timeout_secs   = 60;
     bool        verbose        = false;
     std::string system_prompt;
 };
@@ -59,17 +61,31 @@ AgentResult run_agent(
 namespace llm {
 namespace detail {
 
+// RAII guard for curl_global_init/cleanup.
+// Create ONE instance at program startup (e.g. first line of main).
+// run_agent() does NOT call curl_global_init itself — this is intentional:
+// calling it per-request is not thread-safe and violates libcurl's contract.
+struct CurlGlobalGuard {
+    CurlGlobalGuard()                                  { curl_global_init(CURL_GLOBAL_DEFAULT); }
+    ~CurlGlobalGuard()                                 { curl_global_cleanup(); }
+    CurlGlobalGuard(const CurlGlobalGuard&)            = delete;
+    CurlGlobalGuard& operator=(const CurlGlobalGuard&) = delete;
+};
+
 struct CurlHandle {
     CURL* h;
-    CurlHandle()  : h(curl_easy_init()) {}
-    ~CurlHandle() { if (h) curl_easy_cleanup(h); }
-    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle()                              : h(curl_easy_init()) {}
+    ~CurlHandle()                             { if (h) curl_easy_cleanup(h); }
+    CurlHandle(const CurlHandle&)             = delete;
     CurlHandle& operator=(const CurlHandle&) = delete;
 };
 
 struct SlistHandle {
     curl_slist* s = nullptr;
-    ~SlistHandle() { if (s) curl_slist_free_all(s); }
+    ~SlistHandle()                              { if (s) curl_slist_free_all(s); }
+    SlistHandle(const SlistHandle&)             = delete;
+    SlistHandle& operator=(const SlistHandle&) = delete;
+    SlistHandle()                               = default;
 };
 
 static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
@@ -77,10 +93,12 @@ static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
     return size * nmemb;
 }
 
-static std::string post_json(const std::string& url, const std::string& api_key, const std::string& body) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+static std::string post_json(const std::string& url,
+                              const std::string& api_key,
+                              const std::string& body,
+                              long timeout_secs) {
     CurlHandle ch;
-    if (!ch.h) { curl_global_cleanup(); throw std::runtime_error("curl_easy_init failed"); }
+    if (!ch.h) throw std::runtime_error("curl_easy_init failed");
     SlistHandle sh;
     sh.s = curl_slist_append(sh.s, ("Authorization: Bearer " + api_key).c_str());
     sh.s = curl_slist_append(sh.s, "Content-Type: application/json");
@@ -91,8 +109,8 @@ static std::string post_json(const std::string& url, const std::string& api_key,
     curl_easy_setopt(ch.h, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(ch.h, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(ch.h, CURLOPT_TIMEOUT, timeout_secs);
     CURLcode rc = curl_easy_perform(ch.h);
-    curl_global_cleanup();
     if (rc != CURLE_OK) throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(rc));
     return resp;
 }
@@ -111,14 +129,13 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Extract a string value for key from JSON (simple, non-nested)
 static std::string json_str(const std::string& json, const std::string& key) {
     auto pos = json.find("\"" + key + "\":\"");
     if (pos == std::string::npos) return "";
     pos += key.size() + 4;
     std::string val;
     while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos+1 < json.size()) { ++pos; val += json[pos]; }
+        if (json[pos] == '\\' && pos + 1 < json.size()) { ++pos; val += json[pos]; }
         else val += json[pos];
         ++pos;
     }
@@ -126,7 +143,6 @@ static std::string json_str(const std::string& json, const std::string& key) {
 }
 
 static std::string json_str_raw(const std::string& json, const std::string& key) {
-    // also handles non-quoted values (for finish_reason etc)
     auto pos = json.find("\"" + key + "\":");
     if (pos == std::string::npos) return "";
     pos += key.size() + 3;
@@ -141,15 +157,40 @@ static std::string json_str_raw(const std::string& json, const std::string& key)
         }
         return val;
     }
-    // bare value
     std::string val;
-    while (pos < json.size() && json[pos] != ',' && json[pos] != '}' && json[pos] != '\n') val += json[pos++];
-    // trim
+    while (pos < json.size() && json[pos] != ',' && json[pos] != '}' && json[pos] != '\n')
+        val += json[pos++];
     while (!val.empty() && (val.back()==' '||val.back()=='\r')) val.pop_back();
     return val;
 }
 
-// Build tools JSON array for OpenAI function calling
+// Recursively search nested JSON objects for a quoted string value.
+// Handles models that nest the function name inside a "function":{...} block.
+static std::string json_str_deep(const std::string& json, const std::string& key) {
+    std::string direct = json_str(json, key);
+    if (!direct.empty()) return direct;
+    size_t depth = 0;
+    for (size_t i = 0; i < json.size(); ++i) {
+        if (json[i] == '{') {
+            ++depth;
+            if (depth > 1) {
+                size_t d = 1, j = i + 1;
+                while (j < json.size() && d > 0) {
+                    if (json[j] == '{') ++d;
+                    else if (json[j] == '}') --d;
+                    ++j;
+                }
+                std::string r = json_str(json.substr(i, j - i), key);
+                if (!r.empty()) return r;
+                i = j - 1;
+            }
+        } else if (json[i] == '}' && depth > 0) {
+            --depth;
+        }
+    }
+    return "";
+}
+
 static std::string build_tools_json(const std::vector<Tool>& tools) {
     std::string out = "[";
     for (size_t ti = 0; ti < tools.size(); ++ti) {
@@ -175,21 +216,23 @@ static std::string build_tools_json(const std::vector<Tool>& tools) {
     return out;
 }
 
-// Parse tool_calls from response — returns first tool call name + arguments JSON string
 static bool parse_tool_call(const std::string& resp,
                               std::string& tool_name,
                               std::string& args_json,
                               std::string& call_id) {
     auto pos = resp.find("\"tool_calls\"");
     if (pos == std::string::npos) return false;
-    // find function name
-    auto fn_pos = resp.find("\"name\":", pos);
+
+    auto id_pos = resp.find("\"id\":", pos);
+    if (id_pos != std::string::npos) call_id = json_str(resp.substr(id_pos), "id");
+
+    auto fn_pos = resp.find("\"function\":", pos);
     if (fn_pos == std::string::npos) return false;
-    tool_name = json_str(resp.substr(fn_pos), "name");
-    // find arguments
+    tool_name = json_str_deep(resp.substr(fn_pos), "name");
+
     auto arg_pos = resp.find("\"arguments\":", pos);
     if (arg_pos == std::string::npos) return false;
-    arg_pos += 12; // skip "arguments":
+    arg_pos += 12;
     while (arg_pos < resp.size() && resp[arg_pos]==' ') ++arg_pos;
     if (arg_pos < resp.size() && resp[arg_pos]=='"') {
         ++arg_pos;
@@ -201,25 +244,19 @@ static bool parse_tool_call(const std::string& resp,
         }
         args_json = raw;
     }
-    // find call id
-    auto id_pos = resp.find("\"id\":", pos);
-    if (id_pos != std::string::npos) call_id = json_str(resp.substr(id_pos), "id");
     return !tool_name.empty();
 }
 
-// Parse key:value pairs from a JSON object string like {"a":"1","b":"2"}
 static std::map<std::string,std::string> parse_args(const std::string& args_json) {
     std::map<std::string,std::string> result;
     size_t i = 0;
     while (i < args_json.size()) {
-        // find key
         auto kstart = args_json.find('"', i);
         if (kstart == std::string::npos) break;
         ++kstart;
         auto kend = args_json.find('"', kstart);
         if (kend == std::string::npos) break;
         std::string key = args_json.substr(kstart, kend-kstart);
-        // find colon
         auto colon = args_json.find(':', kend);
         if (colon == std::string::npos) break;
         ++colon;
@@ -245,13 +282,12 @@ static std::map<std::string,std::string> parse_args(const std::string& args_json
     return result;
 }
 
-// Extract content text from response
 static std::string parse_content(const std::string& resp) {
     auto pos = resp.find("\"content\":");
     if (pos == std::string::npos) return "";
     pos += 10;
     while (pos < resp.size() && resp[pos]==' ') ++pos;
-    if (pos < resp.size() && resp[pos]=='n') return ""; // null
+    if (pos < resp.size() && resp[pos]=='n') return "";
     if (pos < resp.size() && resp[pos]=='"') {
         ++pos;
         std::string val;
@@ -274,7 +310,6 @@ AgentResult run_agent(const std::string& prompt,
     result.iterations_used        = 0;
     result.max_iterations_reached = false;
 
-    // Build conversation history as a JSON array string
     std::string messages = "[";
     if (!config.system_prompt.empty())
         messages += "{\"role\":\"system\",\"content\":\"" + detail::json_escape(config.system_prompt) + "\"},";
@@ -293,12 +328,10 @@ AgentResult run_agent(const std::string& prompt,
         if (config.verbose) std::cerr << "[agent] Iteration " << (iter+1) << " request...\n";
 
         std::string resp = detail::post_json(
-            "https://api.openai.com/v1/chat/completions",
-            config.api_key, body);
+            config.api_url, config.api_key, body, config.timeout_secs);
 
         if (config.verbose) std::cerr << "[agent] Response: " << resp.substr(0, 200) << "...\n";
 
-        // Check finish_reason
         std::string finish = detail::json_str_raw(resp, "finish_reason");
 
         std::string tool_name, args_json, call_id;
@@ -307,7 +340,6 @@ AgentResult run_agent(const std::string& prompt,
         if (has_tool && finish != "stop") {
             auto args = detail::parse_args(args_json);
 
-            // Find tool
             std::string tool_result = "[tool not found]";
             for (const auto& t : tools) {
                 if (t.name == tool_name) {
@@ -326,7 +358,6 @@ AgentResult run_agent(const std::string& prompt,
             step.tool_result = tool_result;
             result.steps.push_back(step);
 
-            // Append assistant tool call + tool result to messages
             messages += ",{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"" +
                         detail::json_escape(call_id) + "\",\"type\":\"function\",\"function\":{\"name\":\"" +
                         detail::json_escape(tool_name) + "\",\"arguments\":\"" +
@@ -335,7 +366,6 @@ AgentResult run_agent(const std::string& prompt,
                         detail::json_escape(call_id) + "\",\"content\":\"" +
                         detail::json_escape(tool_result) + "\"}";
         } else {
-            // Final answer
             std::string content = detail::parse_content(resp);
             result.answer = content;
             AgentStep step;
