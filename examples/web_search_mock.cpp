@@ -3,42 +3,47 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <string>
+
+// Mock "web search" tool — returns canned results
+static std::string mock_search(const std::string& query) {
+    static const std::map<std::string, std::string> db = {
+        {"tokio", "Tokio is an async runtime for Rust. Current version: 1.40."},
+        {"openai", "OpenAI was founded in 2015. GPT-4o is their latest model."},
+        {"rust",  "Rust is a systems programming language. Version 1.82 (2024)."},
+    };
+    std::string lq = query;
+    for (char& c : lq) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    for (const auto& [k, v] : db)
+        if (lq.find(k) != std::string::npos) return v;
+    return "No results found for: " + query;
+}
+
 int main() {
     const char* key = std::getenv("OPENAI_API_KEY");
     if (!key || !key[0]) { std::cerr << "OPENAI_API_KEY not set\n"; return 1; }
-    // Mock search database
-    std::map<std::string, std::string> search_db = {
-        {"climate change", "Global temperatures have risen 1.1C since pre-industrial times."},
-        {"renewable energy", "Solar and wind now account for 12% of global electricity."},
-        {"carbon capture", "Direct air capture removes CO2 at ~$400 per tonne currently."},
+
+    llm::Tool search;
+    search.name              = "web_search";
+    search.description       = "Search the web for information about a topic";
+    search.param_names       = {"query"};
+    search.param_descriptions = {"The search query"};
+    search.fn = [](std::map<std::string, std::string> args) -> std::string {
+        return mock_search(args["query"]);
     };
-    std::vector<llm::Tool> tools;
-    tools.push_back({
-        "search", "Search for information on a topic",
-        {"query"}, {"The search query"},
-        [&search_db](std::map<std::string, std::string> args) -> std::string {
-            std::string q = args["query"];
-            for (const auto& [k, v] : search_db) {
-                if (q.find(k) != std::string::npos || k.find(q) != std::string::npos)
-                    return v;
-            }
-            return "No results found for: " + q;
-        }
-    });
+
     llm::AgentConfig cfg;
-    cfg.api_key = key;
-    cfg.model   = "gpt-4o-mini";
-    cfg.max_iterations = 5;
-    cfg.system_prompt = "You are a research assistant. Use the search tool to find relevant information before answering.";
-    std::string prompt = "What is the current state of climate change and what solutions exist?";
-    std::cout << "Question: " << prompt << "\n\n=== Agent Trace ===\n";
-    auto result = llm::run_agent(prompt, tools, cfg);
-    for (const auto& step : result.steps) {
-        if (step.type == llm::AgentStep::Type::ToolCall)
-            std::cout << "  SEARCH: \"" << step.tool_args.at("query")
-                      << "\" -> " << step.tool_result << "\n";
-        else
-            std::cout << "\nAnswer: " << step.content << "\n";
-    }
+    cfg.api_key      = key;
+    cfg.model        = "gpt-4o-mini";
+    cfg.system_prompt = "You are a helpful assistant. Use the web_search tool to look up facts.";
+
+    auto result = llm::run_agent(
+        "What is Tokio and when was OpenAI founded?",
+        {search},
+        cfg
+    );
+
+    std::cout << "Answer:\n" << result.answer << "\n";
+    std::cout << "\nTool calls made: " << result.steps.size() - 1 << "\n";
     return 0;
 }
